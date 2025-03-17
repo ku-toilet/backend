@@ -153,10 +153,9 @@ func CreateReview(c *fiber.Ctx) error {
 
     comment := c.FormValue("comment")
 
-    // ✅ ล็อกค่าที่ได้รับจาก FormData เพื่อตรวจสอบ
     fmt.Println("🔹 Received Data - RestroomID:", restroomID, "UserID:", userID, "Rating:", rating, "Comment:", comment)
 
-    // ✅ สร้างรีวิวใหม่
+    // ✅ บันทึกรีวิวลงฐานข้อมูลก่อน
     review := Review{
         RestroomID: uint(restroomID),
         UserID:     uint(userID),
@@ -164,7 +163,6 @@ func CreateReview(c *fiber.Ctx) error {
         Comment:    comment,
     }
 
-    // ✅ บันทึกลงฐานข้อมูล
     result := db.Create(&review)
     if result.Error != nil {
         fmt.Println("❌ ERROR: Failed to insert review into database:", result.Error)
@@ -173,10 +171,14 @@ func CreateReview(c *fiber.Ctx) error {
 
     fmt.Println("✅ Review successfully saved! Review ID:", review.ReviewID)
 
-    // ✅ รับไฟล์รูปจาก `FormData`
+    // ✅ ลองรับไฟล์รูป (ถ้ามี)
     file, err := c.FormFile("photo")
     if err != nil {
-        return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "File upload failed"})
+        fmt.Println("⚠️ No image uploaded, skipping file upload")
+        return c.JSON(fiber.Map{
+            "message":   "Review added without image!",
+            "review_id": review.ReviewID,
+        })
     }
 
     fileData, err := file.Open()
@@ -185,7 +187,7 @@ func CreateReview(c *fiber.Ctx) error {
     }
     defer fileData.Close()
 
-    // ✅ อัปโหลดไป Google Drive
+    // ✅ อัปโหลดรูปไป Google Drive
     driveLink, err := UploadFileToDrive(file.Filename, fileData, "1P4Jks1kHKduS3yg7mk2uBXqd6EGEmPtI")
     if err != nil {
         return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": "Google Drive upload failed"})
@@ -193,7 +195,7 @@ func CreateReview(c *fiber.Ctx) error {
 
     // ✅ บันทึกรูปภาพที่เกี่ยวข้องกับรีวิว
     photo := Photo{
-        Base64:      driveLink,
+        Base64:        driveLink,
         PhotoRestroom: nil, // ✅ ต้องเป็น NULL สำหรับรูปคอมเมนต์
         PhotoReview:   &review.ReviewID,
     }
@@ -205,6 +207,7 @@ func CreateReview(c *fiber.Ctx) error {
         "photo_url": driveLink,
     })
 }
+
 
 
 func UploadFileToDrive(filename string, fileData io.Reader, folderID string) (string, error) {
