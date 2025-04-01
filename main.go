@@ -62,11 +62,12 @@ type Restroom struct {
 
 // ตาราง Review
 type Review struct {
-	ReviewID   uint    `json:"review_id" gorm:"primaryKey;autoIncrement"`
-	RestroomID uint    `json:"restroom_id" gorm:"not null"`
-	UserID     uint    `json:"user_id" gorm:"not null"`
-	Rating     float64 `json:"rating" gorm:"not null"`
-	Comment    string  `json:"comment"`
+	ReviewID   uint      `json:"review_id" gorm:"primaryKey;autoIncrement"`
+	RestroomID uint      `json:"restroom_id" gorm:"not null"`
+	UserID     uint      `json:"user_id" gorm:"not null"`
+	Rating     float64   `json:"rating" gorm:"not null"`
+	Comment    string    `json:"comment"`
+	ReviewDate time.Time `json:"review_date" gorm:"type:date;default:CURRENT_DATE"` // เพิ่มฟิลด์วันที่
 }
 
 // ตาราง Photo
@@ -182,12 +183,17 @@ func CreateReviewWithBase64(c *fiber.Ctx) error {
 		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "Invalid rating"})
 	}
 
+	// ดึงวันที่ปัจจุบัน (เฉพาะวันที่ ไม่รวมเวลา)
+	now := time.Now()
+	currentDate := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+
 	// บันทึกข้อมูลรีวิวลงในฐานข้อมูล
 	review := Review{
 		RestroomID: uint(restroomID),
 		UserID:     uint(userID),
 		Rating:     rating,
 		Comment:    requestData.Comment,
+		ReviewDate: currentDate, // เพิ่มวันที่รีวิว
 	}
 
 	// สร้างรีวิวก่อน เพื่อให้ได้ review_id
@@ -324,6 +330,7 @@ func CreateReviewWithBase64(c *fiber.Ctx) error {
 		"name":        restroom.BuildingName,
 		"username":    user.FirstName + " " + user.LastName,
 		"photo_url":   photoURL,
+		"review_date": currentDate.Format("2006-01-02"), // เพิ่มวันที่ในรูปแบบ yyyy-mm-dd
 	})
 }
 
@@ -349,12 +356,17 @@ func CreateReview(c *fiber.Ctx) error {
 
 	fmt.Println("🔹 Received Data - RestroomID:", restroomID, "UserID:", userID, "Rating:", rating, "Comment:", comment)
 
+	// ดึงวันที่ปัจจุบัน (เฉพาะวันที่ ไม่รวมเวลา)
+	now := time.Now()
+	currentDate := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+
 	// บันทึกรีวิวลงฐานข้อมูล
 	review := Review{
 		RestroomID: uint(restroomID),
 		UserID:     uint(userID),
 		Rating:     rating,
 		Comment:    comment,
+		ReviewDate: currentDate, // เพิ่มวันที่รีวิว
 	}
 
 	result := db.Create(&review)
@@ -417,6 +429,7 @@ func CreateReview(c *fiber.Ctx) error {
 		"name":        restroom.BuildingName,
 		"username":    user.FirstName + " " + user.LastName,
 		"photo_url":   photoURL,
+		"review_date": currentDate.Format("2006-01-02"), // เพิ่มวันที่ในรูปแบบ yyyy-mm-dd
 	})
 }
 
@@ -437,13 +450,13 @@ func getAllReviewsForAdmin(c *fiber.Ctx) error {
 
 	// คำสั่ง SQL เพื่อดึงข้อมูลรีวิวทั้งหมดพร้อมข้อมูลผู้ใช้และห้องน้ำ
 	rows, err := db.Raw(`
-        SELECT r.review_id, r.restroom_id, r.user_id, r.rating, r.comment, r.created_at,
+        SELECT r.review_id, r.restroom_id, r.user_id, r.rating, r.comment, r.review_date, 
                u.first_name, u.last_name, u.email,
                rs.building_name, rs.floor
         FROM reviews r
         JOIN users u ON r.user_id = u.user_id
         JOIN restrooms rs ON r.restroom_id = rs.restroom_id
-        ORDER BY r.created_at DESC
+        ORDER BY r.review_date DESC
     `).Rows()
 
 	if err != nil {
@@ -463,9 +476,9 @@ func getAllReviewsForAdmin(c *fiber.Ctx) error {
 		var rating float64
 		var comment, firstName, lastName, email, buildingName string
 		var floor int
-		var createdAt time.Time
+		var reviewDate time.Time
 
-		if err := rows.Scan(&reviewID, &restroomID, &userID, &rating, &comment, &createdAt,
+		if err := rows.Scan(&reviewID, &restroomID, &userID, &rating, &comment, &reviewDate,
 			&firstName, &lastName, &email, &buildingName, &floor); err != nil {
 			fmt.Println("❌ เกิดข้อผิดพลาดในการอ่านข้อมูลรีวิว:", err)
 			continue
@@ -482,7 +495,7 @@ func getAllReviewsForAdmin(c *fiber.Ctx) error {
 			"user_id":       userID,
 			"rating":        rating,
 			"comment":       comment,
-			"created_at":    createdAt,
+			"review_date":   reviewDate.Format("2006-01-02"), // เพิ่มวันที่รีวิวในรูปแบบ yyyy-mm-dd
 			"first_name":    firstName,
 			"last_name":     lastName,
 			"email":         email,
@@ -582,7 +595,8 @@ func UploadFileToDrive(filename string, fileData io.Reader, folderID string) (st
 		return "", fmt.Errorf("Google Drive permission failed: %v", err)
 	}
 
-	link := "https://drive.google.com/file/d/" + file.Id + "/view?usp=drive_link"
+	// เปลี่ยนจากลิงค์ดู (view) เป็นลิงค์รูปขนาดย่อ (thumbnail)
+	link := "https://drive.google.com/thumbnail?id=" + file.Id + "&sz=w1000"
 
 	fmt.Println("✅ SUCCESS: File uploaded:", link)
 	return link, nil
@@ -683,6 +697,7 @@ func main() {
 						"last_name":   lastName,  // ✅ เพิ่มนามสกุลที่นี่
 						"rating":      review.Rating,
 						"comment":     review.Comment,
+						"review_date": review.ReviewDate.Format("2006-01-02"), // เพิ่มวันที่รีวิวในรูปแบบ yyyy-mm-dd
 					},
 					"photos": reviewPhotos,
 				})
