@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"github.com/gofiber/fiber/v2"
@@ -9,20 +10,14 @@ import (
 	"golang.org/x/oauth2/google"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
+	"io"
 	"log"
 	"net/http"
 	"os"
-
-	"context"
-	"encoding/base64"
-	"io"
+	"strconv"
 	"strings"
 	"time"
-
-	"strconv"
-
-	"google.golang.org/api/drive/v3"
-	"google.golang.org/api/option"
+	
 )
 
 // ตัวแปรเก็บการเชื่อมต่อ Database
@@ -70,10 +65,10 @@ type Review struct {
 	ReviewDate time.Time `json:"review_date" gorm:"type:date;default:CURRENT_DATE"` // เพิ่มฟิลด์วันที่
 }
 
-// ตาราง Photo
+// ตาราง Photo แก้ไขให้ base64 เป็น text
 type Photo struct {
 	PhotoID       uint   `json:"photo_id" gorm:"primaryKey;autoIncrement"`
-	Base64        string `json:"base64" gorm:"not null"`
+	Base64        string `json:"base64" gorm:"type:text;not null"` // เปลี่ยนเป็น type:text
 	PhotoRestroom *uint  `json:"photo_restroom" gorm:"default:null"`
 	PhotoReview   *uint  `json:"photo_review" gorm:"default:null"`
 }
@@ -103,6 +98,10 @@ func initDatabase() {
 	if err != nil {
 		log.Fatalf("❌ Failed to connect to database: %v", err)
 	}
+
+	// อัพเดทคอลัมน์ base64 เป็น TEXT (ถ้ายังไม่ได้ทำ)
+	db.Exec("ALTER TABLE photos ALTER COLUMN base64 TYPE TEXT;")
+
 	db.AutoMigrate(&Restroom{}, &Review{}, &Photo{}, &User{})
 	log.Println("✅ Database connected and migrated!")
 }
@@ -144,6 +143,29 @@ func googleAuthHandler(c *fiber.Ctx) error {
 	})
 }
 
+// ฟังก์ชันแปลงไฟล์เป็น base64
+func ConvertToBase64(fileData io.Reader) (string, error) {
+	// อ่านข้อมูลไฟล์ทั้งหมด
+	fileBytes, err := io.ReadAll(fileData)
+	if err != nil {
+		fmt.Println("❌ ERROR: อ่านไฟล์ไม่สำเร็จ:", err)
+		return "", fmt.Errorf("อ่านไฟล์ไม่สำเร็จ: %v", err)
+	}
+
+	// ตรวจสอบประเภทไฟล์เพื่อกำหนด MIME type ที่ถูกต้อง
+	mimeType := http.DetectContentType(fileBytes)
+
+	// แปลงเป็น base64
+	base64Data := base64.StdEncoding.EncodeToString(fileBytes)
+	
+	// เพิ่ม prefix สำหรับแสดงผลรูปภาพในรูปแบบ base64 data URL
+	base64URL := fmt.Sprintf("data:%s;base64,%s", mimeType, base64Data)
+	
+	fmt.Println("✅ แปลงไฟล์เป็น base64 สำเร็จ (ขนาด:", len(base64URL), "bytes)")
+	return base64URL, nil
+}
+
+// แก้ไขฟังก์ชัน CreateReviewWithBase64 ให้ใช้ base64 โดยตรง
 func CreateReviewWithBase64(c *fiber.Ctx) error {
 	// แสดงข้อมูล request ทั้งหมดเพื่อการ debug
 	body := c.Body()
@@ -205,109 +227,37 @@ func CreateReviewWithBase64(c *fiber.Ctx) error {
 
 	fmt.Println("✅ Review successfully saved with ID:", review.ReviewID)
 
-	// ถ้ามีรูปภาพแบบ base64 ให้แปลงและบันทึก
+	// ถ้ามีรูปภาพแบบ base64 ให้บันทึกลงฐานข้อมูลโดยตรง
 	var photoURL string
 	if requestData.PhotoBase64 != "" {
 		// ตรวจสอบความยาวของข้อมูล base64
 		fmt.Println("🔹 Base64 data length:", len(requestData.PhotoBase64))
 
-		// แยกข้อมูล base64 ออกจาก header (ถ้ามี)
+		// ตรวจสอบว่ามี data: prefix หรือไม่
 		base64Data := requestData.PhotoBase64
-		if strings.Contains(base64Data, ";base64,") {
-			parts := strings.Split(base64Data, ";base64,")
-			if len(parts) == 2 {
-				base64Data = parts[1]
-				fmt.Println("🔹 Base64 prefix detected and stripped")
-			}
+		if !strings.Contains(base64Data, "data:") {
+			// ถ้าไม่มี data: prefix ให้เพิ่ม
+			base64Data = "data:image/jpeg;base64," + base64Data
 		}
 
-		// แปลงข้อมูล base64 เป็น binary
-		imgData, err := base64.StdEncoding.DecodeString(base64Data)
-		if err != nil {
-			fmt.Println("❌ ERROR: Failed to decode base64 image:", err)
-			// แม้มีปัญหากับรูปภาพ แต่เรายังคงสร้างรีวิวไปแล้ว จึงส่งคืนข้อมูลรีวิวโดยไม่มีรูป
-			return c.JSON(fiber.Map{
-				"message":     "Review added successfully, but image processing failed",
-				"review_id":   review.ReviewID,
-				"error_image": err.Error(),
-			})
-		}
-
-		// สร้างชื่อไฟล์ชั่วคราว
-		tmpFileName := fmt.Sprintf("review_%d_%d.jpg", review.ReviewID, time.Now().Unix())
-
-		// สร้างไฟล์ชั่วคราวเพื่อใช้ในการอัปโหลด
-		tempFile, err := os.CreateTemp("", tmpFileName)
-		if err != nil {
-			fmt.Println("❌ ERROR: Failed to create temp file:", err)
-			// ส่งคืนข้อมูลรีวิวโดยไม่มีรูป
-			return c.JSON(fiber.Map{
-				"message":     "Review added successfully, but image processing failed",
-				"review_id":   review.ReviewID,
-				"error_image": "Failed to create temporary file",
-			})
-		}
-		defer os.Remove(tempFile.Name())
-
-		// เขียนข้อมูลรูปภาพลงไฟล์ชั่วคราว
-		if _, err := tempFile.Write(imgData); err != nil {
-			fmt.Println("❌ ERROR: Failed to write to temp file:", err)
-			tempFile.Close()
-			// ส่งคืนข้อมูลรีวิวโดยไม่มีรูป
-			return c.JSON(fiber.Map{
-				"message":     "Review added successfully, but image processing failed",
-				"review_id":   review.ReviewID,
-				"error_image": "Failed to write image data",
-			})
-		}
-
-		// ปิดไฟล์เพื่อให้แน่ใจว่าข้อมูลถูกเขียนลงดิสก์
-		tempFile.Close()
-
-		// เปิดไฟล์เพื่ออ่านข้อมูล
-		fileData, err := os.Open(tempFile.Name())
-		if err != nil {
-			fmt.Println("❌ ERROR: Failed to open temp file:", err)
-			// ส่งคืนข้อมูลรีวิวโดยไม่มีรูป
-			return c.JSON(fiber.Map{
-				"message":     "Review added successfully, but image processing failed",
-				"review_id":   review.ReviewID,
-				"error_image": "Failed to read image data",
-			})
-		}
-		defer fileData.Close()
-
-		// อัปโหลดรูปไป Google Drive
-		driveLink, err := UploadFileToDrive(tmpFileName, fileData, "1P4Jks1kHKduS3yg7mk2uBXqd6EGEmPtI")
-		if err != nil {
-			fmt.Println("❌ ERROR: Failed to upload to Google Drive:", err)
-			// ส่งคืนข้อมูลรีวิวโดยไม่มีรูป
-			return c.JSON(fiber.Map{
-				"message":     "Review added successfully, but image upload failed",
-				"review_id":   review.ReviewID,
-				"error_image": "Failed to upload to Google Drive",
-			})
-		}
-
-		// บันทึกข้อมูลรูปภาพลงฐานข้อมูล - ดูให้แน่ใจว่า photo_review ถูกตั้งเป็น review.ReviewID
-		reviewID := review.ReviewID // สำคัญ: ใช้ ID จากรีวิวที่สร้างไปแล้ว
+		// บันทึกข้อมูล base64 ลงฐานข้อมูลโดยตรง
+		reviewID := review.ReviewID
 		photo := Photo{
-			Base64:        driveLink,
+			Base64:        base64Data,
 			PhotoRestroom: nil,
-			PhotoReview:   &reviewID, // เชื่อมโยงกับ review_id
+			PhotoReview:   &reviewID,
 		}
 
 		photoResult := db.Create(&photo)
 		if photoResult.Error != nil {
 			fmt.Println("❌ ERROR: Failed to save photo:", photoResult.Error)
-			// ส่งคืนข้อมูลรีวิวโดยไม่มีรูป
 			return c.JSON(fiber.Map{
-				"message":   "Review added successfully, but failed to save photo in database",
-				"review_id": review.ReviewID,
-				"error_db":  photoResult.Error.Error(),
+				"message":     "Review added successfully, but image saving failed",
+				"review_id":   review.ReviewID,
+				"error_image": photoResult.Error.Error(),
 			})
 		} else {
-			photoURL = driveLink
+			photoURL = base64Data
 			fmt.Println("✅ Photo saved successfully with ID:", photo.PhotoID, "linked to review:", reviewID)
 		}
 	}
@@ -334,7 +284,7 @@ func CreateReviewWithBase64(c *fiber.Ctx) error {
 	})
 }
 
-// ฟังก์ชันอัปโหลดรูปไป Google Drive
+// แก้ไขฟังก์ชัน CreateReview ให้ใช้ base64 แทน Google Drive
 func CreateReview(c *fiber.Ctx) error {
 	// ดึงข้อมูลจาก form
 	restroomID, err := strconv.Atoi(c.FormValue("restroom_id"))
@@ -389,15 +339,15 @@ func CreateReview(c *fiber.Ctx) error {
 		}
 		defer fileData.Close()
 
-		// อัปโหลดรูปไป Google Drive
-		driveLink, err := UploadFileToDrive(file.Filename, fileData, "1P4Jks1kHKduS3yg7mk2uBXqd6EGEmPtI")
+		// แปลงรูปภาพเป็น base64
+		base64Data, err := ConvertToBase64(fileData)
 		if err != nil {
-			return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": "Google Drive upload failed"})
+			return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to convert to base64"})
 		}
 
 		// บันทึกข้อมูลรูปภาพลงฐานข้อมูล
 		photo := Photo{
-			Base64:        driveLink,
+			Base64:        base64Data,
 			PhotoRestroom: nil,
 			PhotoReview:   &review.ReviewID, // บันทึก review_id ของความคิดเห็นนี้
 		}
@@ -406,7 +356,7 @@ func CreateReview(c *fiber.Ctx) error {
 		if photoResult.Error != nil {
 			fmt.Println("❌ ERROR: Failed to save photo:", photoResult.Error)
 		} else {
-			photoURL = driveLink
+			photoURL = base64Data
 			fmt.Println("✅ Photo saved successfully! Photo ID:", photo.PhotoID)
 		}
 	}
@@ -505,11 +455,7 @@ func getAllReviewsForAdmin(c *fiber.Ctx) error {
 
 		// เพิ่มข้อมูลรูปภาพถ้ามี
 		if len(photos) > 0 {
-			photoURLs := make([]string, len(photos))
-			for i, photo := range photos {
-				photoURLs[i] = photo.Base64
-			}
-			review["photo_url"] = photoURLs[0] // ใช้รูปแรก
+			review["photo_url"] = photos[0].Base64 // ใช้รูปแรก
 		}
 
 		reviews = append(reviews, review)
@@ -568,42 +514,166 @@ func deleteReviewForAdmin(c *fiber.Ctx) error {
 	})
 }
 
-func UploadFileToDrive(filename string, fileData io.Reader, folderID string) (string, error) {
-	ctx := context.Background()
-	service, err := drive.NewService(ctx, option.WithCredentialsFile("credentials.json"))
-	if err != nil {
-		fmt.Println("❌ ERROR: Cannot create Google Drive service:", err)
-		return "", fmt.Errorf("Google Drive service failed: %v", err)
+// เพิ่มฟังก์ชันย้ายข้อมูลรูปภาพจาก Google Drive เป็น base64
+func migratePhotosToBase64(c *fiber.Ctx) error {
+	// ตรวจสอบว่าผู้ใช้มีสิทธิ์แอดมินหรือไม่
+	email := c.Query("email", "")
+	if email != "admkutoilet@gmail.com" {
+		return c.Status(http.StatusUnauthorized).JSON(fiber.Map{
+			"error": "คุณไม่มีสิทธิ์เข้าถึงฟังก์ชันนี้",
+		})
 	}
 
-	fileMetadata := &drive.File{
-		Name:    filename,
-		Parents: []string{folderID},
+	// ตรวจสอบจำนวนรูปที่ต้องการย้าย
+	var count int64
+	db.Model(&Photo{}).
+		Where("base64 LIKE 'https://drive.google.com%' OR base64 LIKE 'https://lh3.googleusercontent.com%'").
+		Count(&count)
+
+	// ถ้าไม่มีรูปที่ต้องย้าย
+	if count == 0 {
+		return c.JSON(fiber.Map{
+			"message": "ไม่พบรูปภาพที่ต้องการย้าย",
+			"count":   0,
+		})
 	}
 
-	file, err := service.Files.Create(fileMetadata).Media(fileData).Do()
-	if err != nil {
-		fmt.Println("❌ ERROR: Cannot upload file:", err)
-		return "", fmt.Errorf("Google Drive upload failed: %v", err)
+	// แสดงจำนวนรูปที่จะย้าย
+	fmt.Printf("🔹 พบรูปภาพที่ต้องการย้ายทั้งหมด %d รูป\n", count)
+
+	// ส่งคืนข้อมูลเบื้องต้น
+	return c.JSON(fiber.Map{
+		"message": "พบรูปภาพที่ต้องย้าย",
+		"count":   count,
+		"note":    "กระบวนการย้ายข้อมูลจะใช้เวลานาน กรุณาใช้ endpoint /admin/migratePhotos/start เพื่อเริ่มการย้ายข้อมูล",
+	})
+}
+
+// ฟังก์ชันเริ่มการย้ายข้อมูล
+func startMigratePhotosToBase64(c *fiber.Ctx) error {
+	// ตรวจสอบว่าผู้ใช้มีสิทธิ์แอดมินหรือไม่
+	email := c.Query("email", "")
+	if email != "admkutoilet@gmail.com" {
+		return c.Status(http.StatusUnauthorized).JSON(fiber.Map{
+			"error": "คุณไม่มีสิทธิ์เข้าถึงฟังก์ชันนี้",
+		})
 	}
 
-	_, err = service.Permissions.Create(file.Id, &drive.Permission{
-		Role: "reader", Type: "anyone",
-	}).Do()
-	if err != nil {
-		fmt.Println("❌ ERROR: Cannot set file permission:", err)
-		return "", fmt.Errorf("Google Drive permission failed: %v", err)
+	// สร้าง HTTP client สำหรับดาวน์โหลดรูปภาพ
+	client := &http.Client{
+		Timeout: 30 * time.Second,
 	}
 
-	// เปลี่ยนจากลิงค์ดู (view) เป็นลิงค์รูปขนาดย่อ (thumbnail)
-	link := "https://drive.google.com/thumbnail?id=" + file.Id + "&sz=w1000"
+	// จำกัดจำนวนรูปภาพที่จะประมวลผลต่อครั้ง (batch)
+	limit := 10
+	limitStr := c.Query("limit", "10")
+	limit, _ = strconv.Atoi(limitStr)
 
-	fmt.Println("✅ SUCCESS: File uploaded:", link)
-	return link, nil
+	// ดึงรูปภาพที่เป็น URL Google Drive
+	var photos []Photo
+	result := db.Where("base64 LIKE 'https://drive.google.com%' OR base64 LIKE 'https://lh3.googleusercontent.com%'").
+		Limit(limit).
+		Find(&photos)
+
+	if result.Error != nil {
+		fmt.Println("❌ เกิดข้อผิดพลาดในการดึงข้อมูลรูปภาพ:", result.Error)
+		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{
+			"error": "เกิดข้อผิดพลาดในการดึงข้อมูลรูปภาพ",
+		})
+	}
+
+	if len(photos) == 0 {
+		return c.JSON(fiber.Map{
+			"message": "ไม่พบรูปภาพที่ต้องการย้าย",
+			"count":   0,
+		})
+	}
+
+	fmt.Printf("🔹 กำลังย้ายข้อมูลรูปภาพจำนวน %d รูป\n", len(photos))
+
+	// ข้อมูลสถิติ
+	successCount := 0
+	errorCount := 0
+	var errors []string
+
+	// วนลูปประมวลผลรูปภาพ
+	for i, photo := range photos {
+		fmt.Printf("🔹 กำลังประมวลผลรูปที่ %d/%d (ID: %d)\n", i+1, len(photos), photo.PhotoID)
+
+		// ดาวน์โหลดรูปจาก URL
+		resp, err := client.Get(photo.Base64)
+		if err != nil {
+			fmt.Printf("❌ ไม่สามารถดาวน์โหลดรูปได้: %v\n", err)
+			errorCount++
+			errors = append(errors, fmt.Sprintf("ID %d: %v", photo.PhotoID, err))
+			continue
+		}
+
+		// ตรวจสอบสถานะการดาวน์โหลด
+		if resp.StatusCode != http.StatusOK {
+			errMsg := fmt.Sprintf("ดาวน์โหลดรูปไม่สำเร็จ: HTTP %d", resp.StatusCode)
+			fmt.Println("❌", errMsg)
+			resp.Body.Close()
+			errorCount++
+			errors = append(errors, fmt.Sprintf("ID %d: %s", photo.PhotoID, errMsg))
+			continue
+		}
+
+		// อ่านข้อมูลรูปภาพ
+		imgData, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			fmt.Printf("❌ ไม่สามารถอ่านข้อมูลรูปได้: %v\n", err)
+			errorCount++
+			errors = append(errors, fmt.Sprintf("ID %d: %v", photo.PhotoID, err))
+			continue
+		}
+
+		// ตรวจสอบขนาดรูปและประเภทไฟล์
+		fileSize := len(imgData)
+		contentType := http.DetectContentType(imgData)
+		fmt.Printf("🔹 ขนาดรูป: %d bytes, ประเภท: %s\n", fileSize, contentType)
+
+		// ถ้ารูปขนาดเล็กเกินไปหรือไม่ใช่รูปภาพ ให้ข้าม
+		if fileSize < 100 || !strings.HasPrefix(contentType, "image/") {
+			fmt.Println("⚠️ รูปภาพไม่ถูกต้องหรือมีขนาดเล็กเกินไป")
+			errorCount++
+			errors = append(errors, fmt.Sprintf("ID %d: รูปภาพไม่ถูกต้องหรือมีขนาดเล็กเกินไป", photo.PhotoID))
+			continue
+		}
+
+		// แปลงเป็น base64
+		base64Data := base64.StdEncoding.EncodeToString(imgData)
+		base64URL := fmt.Sprintf("data:%s;base64,%s", contentType, base64Data)
+
+		// อัพเดทข้อมูลลงฐานข้อมูล
+		updateResult := db.Model(&Photo{}).Where("photo_id = ?", photo.PhotoID).Update("base64", base64URL)
+		if updateResult.Error != nil {
+			fmt.Printf("❌ ไม่สามารถอัพเดทข้อมูลได้: %v\n", updateResult.Error)
+			errorCount++
+			errors = append(errors, fmt.Sprintf("ID %d: %v", photo.PhotoID, updateResult.Error))
+			continue
+		}
+
+		fmt.Printf("✅ อัพเดทรูปสำเร็จ: ID %d\n", photo.PhotoID)
+		successCount++
+
+		// หยุดพักเล็กน้อยเพื่อไม่ให้ทำงานหนักเกินไป
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	// สรุปผลการทำงาน
+	return c.JSON(fiber.Map{
+		"message":        "การย้ายข้อมูลเสร็จสมบูรณ์",
+		"total":          len(photos),
+		"success_count":  successCount,
+		"error_count":    errorCount,
+		"errors":         errors,
+		"remaining_info": "ใช้ endpoint เดิมซ้ำเพื่อย้ายข้อมูลชุดต่อไป",
+	})
 }
 
 // ปรับปรุงการตั้งค่าเซิร์ฟเวอร์ในฟังก์ชัน main
-// แก้ไขส่วนการลงทะเบียน route ในฟังก์ชัน main
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	log.SetOutput(os.Stdout)
@@ -620,13 +690,13 @@ func main() {
 
 	// ตั้งค่า CORS ให้ถูกต้อง - เปิดการเข้าถึงจากหลาย origin
 	app.Use(cors.New(cors.Config{
-        AllowOrigins:     "*", 
-        AllowMethods:     "GET, POST, PUT, DELETE, OPTIONS",
-        AllowHeaders:     "Origin, Content-Type, Accept, Authorization, X-User-Email",
-        ExposeHeaders:    "Content-Length, Content-Type",
-        AllowCredentials: false,
-        MaxAge:           86400,
-    }))
+		AllowOrigins:     "*", 
+		AllowMethods:     "GET, POST, PUT, DELETE, OPTIONS",
+		AllowHeaders:     "Origin, Content-Type, Accept, Authorization, X-User-Email",
+		ExposeHeaders:    "Content-Length, Content-Type",
+		AllowCredentials: false,
+		MaxAge:           86400,
+	}))
 
 	// เพิ่ม middleware เพื่อแสดง request path และ method (เพื่อการ debug)
 	app.Use(func(c *fiber.Ctx) error {
@@ -767,6 +837,18 @@ func main() {
 	app.Delete("/admin/reviews/:id", func(c *fiber.Ctx) error {
 		fmt.Println("🟢 ได้รับ request สำหรับ DELETE /admin/reviews/:id")
 		return deleteReviewForAdmin(c)
+	})
+
+	// API สำหรับตรวจสอบรูปภาพที่ต้องย้าย
+	app.Get("/admin/migratePhotos", func(c *fiber.Ctx) error {
+		fmt.Println("🟢 ได้รับ request สำหรับ GET /admin/migratePhotos")
+		return migratePhotosToBase64(c)
+	})
+
+	// API สำหรับเริ่มการย้ายข้อมูลรูปภาพ
+	app.Get("/admin/migratePhotos/start", func(c *fiber.Ctx) error {
+		fmt.Println("🟢 ได้รับ request สำหรับ GET /admin/migratePhotos/start")
+		return startMigratePhotosToBase64(c)
 	})
 
 	// เริ่มต้นเซิร์ฟเวอร์บนพอร์ต 3001
